@@ -1,5 +1,5 @@
 import { writeFileSync } from "fs";
-import { flow } from "lodash/fp";
+import { flow, range, values } from "lodash/fp";
 import { PDFDocument, PDFFont, PDFPage, rgb, StandardFonts } from "pdf-lib";
 import { Argv } from "yargs";
 import { ioOptions, outputOption, sizeOptions } from "./common";
@@ -27,9 +27,9 @@ const builder = flow(
         coerce: (value: any[]) =>
           array(either(number, oneOf(["last"] as const))).verify(value),
       })
-      .option("horizontal", {
-        alias: ["h", "y"],
-        describe: "Horizontal position of the page number",
+      .option("vertical", {
+        alias: ["v", "y"],
+        describe: "Vertical position of the page number",
         default: "bottom",
         type: "string",
         coerce: (value: string) =>
@@ -37,9 +37,9 @@ const builder = flow(
             value
           ),
       })
-      .option("vertical", {
-        alias: ["v", "x"],
-        describe: "Vertical position of the page number",
+      .option("horizontal", {
+        alias: ["h", "x"],
+        describe: "Horizontal position of the page number",
         default: "left",
         type: "string",
         coerce: (value: string) =>
@@ -48,8 +48,21 @@ const builder = flow(
           ),
       })
       .option("alternate", {
-        describe: "Alternate page number vertical position",
+        describe: "Alternate page number horizontal position",
         choices: ["parity", "halves"] as const,
+      })
+      .option("font", {
+        describe: "Page number font",
+        choices: values(StandardFonts),
+        default: StandardFonts.HelveticaBold,
+      })
+      .option("size", {
+        describe: "Page number font size",
+        type: "number",
+      })
+      .option("padding", {
+        describe: "Page border padding",
+        type: "number",
       }),
   ioOptions
 );
@@ -63,7 +76,7 @@ type Alternate = Opts["alternate"];
 const getXPosition = (
   pageWidth: number,
   padding: number,
-  position: VerticalPositon
+  position: HorizontalPosition
 ): number => {
   switch (position) {
     case "left":
@@ -80,7 +93,7 @@ const getXPosition = (
 const getYPosition = (
   pageHeight: number,
   padding: number,
-  position: HorizontalPosition
+  position: VerticalPositon
 ): number => {
   switch (position) {
     case "top":
@@ -94,29 +107,10 @@ const getYPosition = (
   }
 };
 
-const drawPageNum = (
-  num: number,
-  page: PDFPage,
-  font: PDFFont,
-  position: [VerticalPositon, HorizontalPosition]
-) => {
-  const { width: pageWidth, height: pageHeight } = page.getSize();
-  const fontSize = pageWidth * 0.05;
-  const padding = pageWidth * 0.05;
-  const text = `${num}`;
-  page.drawText(text, {
-    x: getXPosition(pageWidth, padding, position[0]),
-    y: getYPosition(pageHeight, padding, position[1]),
-    size: fontSize,
-    font,
-    color: rgb(0, 0, 0),
-  });
-};
-
-const alternateVerticalPos = (
-  position: VerticalPositon,
+const alternateHorizontalPos = (
+  position: HorizontalPosition,
   pageWidth: number
-): VerticalPositon => {
+): HorizontalPosition => {
   switch (position) {
     case "left":
       return "right";
@@ -129,57 +123,73 @@ const alternateVerticalPos = (
   }
 };
 
-const getAlternatedVerticalPos = (
-  position: VerticalPositon,
+const getAlternatedHorizontalPos = (
+  position: HorizontalPosition,
   pageWidth: number,
   pageCount: number,
   pageIndex: number,
   alternate?: Alternate
-): VerticalPositon => {
+): HorizontalPosition => {
   if (!alternate) return position;
   switch (alternate) {
     case "parity":
       return pageIndex % 2 == 0
         ? position
-        : alternateVerticalPos(position, pageWidth);
+        : alternateHorizontalPos(position, pageWidth);
     case "halves":
       return pageIndex < pageCount / 2
         ? position
-        : alternateVerticalPos(position, pageWidth);
+        : alternateHorizontalPos(position, pageWidth);
   }
 };
 
-const handler = async ({
-  input,
-  output,
-  offset,
-  skip,
-  horizontal,
-  vertical,
-  alternate,
-}: Opts): Promise<void> => {
-  const data = await readInputOrStdin(input);
+const drawPageNum = (
+  pageNum: number,
+  pageCount: number,
+  page: PDFPage,
+  font: PDFFont,
+  opts: Opts
+) => {
+  if (opts.skip.includes(pageNum)) return;
+  if (pageNum == pageCount && opts.skip.includes("last")) return;
+
+  const horizontalPos = getAlternatedHorizontalPos(
+    opts.horizontal,
+    page.getWidth(),
+    pageCount,
+    pageNum - 1,
+    opts.alternate
+  );
+
+  const { width: pageWidth, height: pageHeight } = page.getSize();
+  const fontSize = opts.size ?? pageWidth * 0.05;
+  const padding = opts.padding ?? pageWidth * 0.05;
+  const text = `${pageNum}`;
+  page.drawText(text, {
+    x: getXPosition(pageWidth, padding, horizontalPos),
+    y: getYPosition(pageHeight, padding, opts.vertical),
+    size: fontSize,
+    font,
+    color: rgb(0, 0, 0),
+  });
+};
+
+const handler = async (opts: Opts): Promise<void> => {
+  const data = await readInputOrStdin(opts.input);
   const sourceDoc = await PDFDocument.load(data);
-  const font = await sourceDoc.embedFont(StandardFonts.HelveticaBold);
+  const embeddedFont = await sourceDoc.embedFont(opts.font);
 
   const pages = sourceDoc.getPages();
-  for (let i = offset; i < pages.length; i++) {
+
+  const startIndex = Math.max(0, opts.offset);
+  range(startIndex, pages.length).forEach((i) => {
     const page = pages[i];
-    const pageNum = i - offset + 1;
-    if (skip.includes(pageNum)) continue;
-    if (i == pages.length - 1 && skip.includes("last")) break;
-    const alternatedVertical = getAlternatedVerticalPos(
-      vertical,
-      page.getWidth(),
-      pages.length,
-      i,
-      alternate
-    );
-    drawPageNum(pageNum, page, font, [alternatedVertical, horizontal]);
-  }
+    const pageNum = i - opts.offset + 1;
+    drawPageNum(pageNum, pages.length, page, embeddedFont, opts);
+  });
 
   const pdfBytes = await sourceDoc.save();
-  writeOutputOrStdout(pdfBytes, output);
+  writeOutputOrStdout(pdfBytes, opts.output);
 };
 
 export { command, description, builder, handler, aliases };
